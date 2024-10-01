@@ -96,6 +96,9 @@ import time
 import tempfile
 import contextlib
 import warnings
+import functools
+import itertools
+import ipaddress
 
 
 from urllib.error import URLError, HTTPError, ContentTooShortError
@@ -2514,11 +2517,62 @@ def getproxies_environment():
                 proxies.pop(proxy_name, None)
     return proxies
 
+@functools.lru_cache(maxsize=50, typed=False)
+class _NoProxy:
+
+    everything: bool
+    hostnames: list[(str, str)]
+    nets_v4: list[(ipaddress.IPv4Network, str)]
+    nets_v6: list[(ipaddress.IPv6Network, str)]
+
+    __slots__ = ("everything", "hostnames", "nets_v4", "nets_v6")
+
+    __init__(self, no_proxy: str):
+        self.everything = no_proxy == "*"
+        if self.everything:
+            return
+
+        no_proxy = [h.lstrip('.') # strip leading dots from matchers
+                    for h in [
+                        host.strip() for host in no_proxy.split(',')]
+                    if h]
+        no_proxy = _splitport(host) for host in no_proxy
+        self.hostnames, networks = itertools.partition(lambda host_port: ':' not in host_port[0] and
+                                                                         any(c.isalpha() for c in host_port[0]),
+                                                       no_proxy)
+        self.hostnames = [h.lower() for h in hostnames]
+        self.nets_v4, self.nets_v6  = itertools.partition(lambda n: n[0].version == 4,
+                                                          (ipaddress.ip_network(net_port[0]), net_port[1])
+                                                              for net_port in networks)
+        # Put broader networks first
+        self.nets_v4.sort(key=lambda n : n[0].netmask)
+        self.nets_v6.sort(key=lambda n : n[0].netmask)
+
+    def __contains__(self, host: str) -> bool:
+
+        if self.everything:
+            return True
+
+        host, port = _splitport(host)
+        if ':' not in host and any(c.isalpha() for c in host):
+            host.lower()
+            # checks either:
+            # - exatch match
+            # - ends with DNS suffix
+            return any((host == h or host.endswith('.' + h)) and port == p
+                       for h, p in self.hostnames)
+        else:
+            ip = ip_address(host)
+            return (ip.version == 4 and any(ip in n and port == p for n, p in networks_4) or
+                    ip.version == 6 and any(ip in n and port == p for n, p in networks_6))
+
+
 def proxy_bypass_environment(host, proxies=None):
     """Test if proxies should not be used for a particular host.
 
     Checks the proxy dict for the value of no_proxy, which should
-    be a list of comma separated DNS suffixes, or '*' for all hosts.
+    be a mixed list of comma separated DNS suffixes, IP addresses (v4 or v6),
+    CIDR (v4 or v6) or '*' for all hosts.
 
     """
     if proxies is None:
@@ -2528,25 +2582,7 @@ def proxy_bypass_environment(host, proxies=None):
         no_proxy = proxies['no']
     except KeyError:
         return False
-    # '*' is special case for always bypass
-    if no_proxy == '*':
-        return True
-    host = host.lower()
-    # strip port off host
-    hostonly, port = _splitport(host)
-    # check if the host ends with any of the DNS suffixes
-    for name in no_proxy.split(','):
-        name = name.strip()
-        if name:
-            name = name.lstrip('.')  # ignore leading dots
-            name = name.lower()
-            if hostonly == name or host == name:
-                return True
-            name = '.' + name
-            if hostonly.endswith(name) or host.endswith(name):
-                return True
-    # otherwise, don't bypass
-    return False
+    return host in _NoProxy(no_proxy)
 
 
 # This code tests an OSX specific data structure but is testable on all
